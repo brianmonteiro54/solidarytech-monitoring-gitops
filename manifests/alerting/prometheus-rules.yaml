@@ -32,7 +32,7 @@ spec:
             runbook_url: "https://github.com/brianmonteiro54/solidarytech-runbooks/blob/main/high-error-rate.md"
             dashboard_url: "http://solidarytech.pt/grafana/d/solidarytech-overview"
 
-        # Alerta: Pod com muitos restarts
+        # Alerta: Pod com muitos restarts (proxy de CrashLoopBackOff)
         - alert: PodCrashLooping
           expr: |
             increase(kube_pod_container_status_restarts_total{namespace=~"solidarytech-.*"}[15m]) > 3
@@ -40,9 +40,39 @@ spec:
           labels:
             severity: warning
             team: solidarytech
+            aiops: "true"
           annotations:
             summary: "Pod {{ $labels.pod }} em crash loop"
             description: "O pod {{ $labels.pod }} no namespace {{ $labels.namespace }} reiniciou {{ $value | printf \"%.0f\" }} vezes nos últimos 15 minutos."
+
+        # Alerta: ImagePullBackOff / ErrImagePull — dispara o AIOps webhook,
+        # que inspeciona a causa (imagem ausente no ECR vs. erro de auth) e,
+        # se for imagem ausente, dispara o workflow_dispatch do CI.
+        - alert: ImagePullBackOff
+          expr: |
+            kube_pod_container_status_waiting_reason{namespace=~"solidarytech-.*", reason=~"ImagePullBackOff|ErrImagePull"} == 1
+          for: 2m
+          labels:
+            severity: warning
+            team: solidarytech
+            aiops: "true"
+          annotations:
+            summary: "Pod {{ $labels.pod }} sem conseguir puxar a imagem"
+            description: "O container {{ $labels.container }} do pod {{ $labels.pod }} no namespace {{ $labels.namespace }} está com {{ $labels.reason }} há mais de 2 minutos."
+
+        # Alerta: OOMKilled — dispara o AIOps webhook, que sugere/abre PR de
+        # rightsizing de memória (heurística: +50% do limite atual).
+        - alert: OOMKilled
+          expr: |
+            kube_pod_container_status_last_terminated_reason{namespace=~"solidarytech-.*", reason="OOMKilled"} == 1
+          for: 0m
+          labels:
+            severity: warning
+            team: solidarytech
+            aiops: "true"
+          annotations:
+            summary: "Container {{ $labels.container }} morto por OOM"
+            description: "O container {{ $labels.container }} do pod {{ $labels.pod }} no namespace {{ $labels.namespace }} foi OOMKilled."
 
         # Alerta: Alta latência P95
         - alert: HighLatencyP95
