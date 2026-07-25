@@ -1080,10 +1080,15 @@ data:
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code, body, ctype="application/json"):
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.end_headers()
-            self.wfile.write(body if isinstance(body, bytes) else body.encode())
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.end_headers()
+                self.wfile.write(body if isinstance(body, bytes) else body.encode())
+            except (BrokenPipeError, ConnectionResetError):
+                # Probe (liveness/readiness) fechou a conexao antes da resposta
+                # terminar de ser escrita. Inofensivo -- so evita traceback no log.
+                pass
 
         def do_POST(self):
             length = int(self.headers.get("Content-Length", 0))
