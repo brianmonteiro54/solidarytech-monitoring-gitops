@@ -55,7 +55,7 @@ ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
 AISUMMARY_MAX_TOKENS = int(os.getenv("AISUMMARY_MAX_TOKENS", "600"))
 
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+TOKEN_GITHUB = os.getenv("TOKEN_GITHUB", "")
 GITHUB_API = os.getenv("GITHUB_API", "https://api.github.com")
 # Repositório onde as issues de incidente são abertas (ITSM leve). Precisa de um
 # PAT com issues:write neste repo. Ajuste para o SEU repo de incidentes.
@@ -99,7 +99,7 @@ except Exception:
 # zero, em que o ECR volta vazio e o pod fica em ImagePullBackOff. O pipeline
 # constrói + publica a imagem no ECR e atualiza o repo de deploy; o Argo CD
 # sincroniza e o pod sobe. Vazio = NÃO dispara build (só diagnostica). JSON no env.
-# ATENÇÃO: o PAT (GITHUB_TOKEN) precisa de actions:write nesses repos de código.
+# ATENÇÃO: o PAT (TOKEN_GITHUB) precisa de actions:write nesses repos de código.
 #   SERVICE_CI_REPO_MAP='{"donation-service":{"repo":"brianmonteiro54/donation-service","workflow":"ci.yaml","ref":"main"}}'
 try:
     SERVICE_CI_REPO_MAP = json.loads(os.getenv("SERVICE_CI_REPO_MAP", "{}"))
@@ -447,14 +447,14 @@ def build_enriched_context(incident):
 # (4)/(6) GitHub — Issues (ITSM) e PRs (rightsizing)
 # ===========================================================================
 def _gh_headers():
-    return {"Authorization": f"Bearer {GITHUB_TOKEN}",
+    return {"Authorization": f"Bearer {TOKEN_GITHUB}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28"}
 
 
 def gh_open_issue(fingerprint, title, body):
     """Abre uma issue de incidente. Devolve número da issue ou None."""
-    if not (GITHUB_TOKEN and ITSM_REPO and ITSM_ENABLED):
+    if not (TOKEN_GITHUB and ITSM_REPO and ITSM_ENABLED):
         return None
     marker = f"\n\n<!-- aiops-incident:{fingerprint} -->"
     status, data = http_json(
@@ -475,7 +475,7 @@ def gh_find_open_issue(fingerprint):
     """Recupera o número da issue aberta desse incidente (sobrevive a restart)."""
     if fingerprint in _open_issues:
         return _open_issues[fingerprint]
-    if not (GITHUB_TOKEN and ITSM_REPO):
+    if not (TOKEN_GITHUB and ITSM_REPO):
         return None
     q = urllib.parse.urlencode(
         {"q": f'repo:{ITSM_REPO} is:issue is:open in:body "aiops-incident:{fingerprint}"'})
@@ -486,7 +486,7 @@ def gh_find_open_issue(fingerprint):
 
 
 def gh_comment_and_close(issue_number, comment):
-    if not (GITHUB_TOKEN and ITSM_REPO and issue_number):
+    if not (TOKEN_GITHUB and ITSM_REPO and issue_number):
         return
     http_json(f"{GITHUB_API}/repos/{ITSM_REPO}/issues/{issue_number}/comments",
               data={"body": comment[:60000]}, headers=_gh_headers(), method="POST")
@@ -500,7 +500,7 @@ def gh_open_pr_bump_memory(service, new_limit, root_cause):
     """Abre um PR bumpando o limite de memória do Deployment do serviço.
     Requer SERVICE_REPO_MAP[service] = {repo, path}. Devolve URL do PR ou None."""
     m = SERVICE_REPO_MAP.get(service)
-    if not (GITHUB_TOKEN and m and m.get("repo") and m.get("path")):
+    if not (TOKEN_GITHUB and m and m.get("repo") and m.get("path")):
         return None
     repo, path = m["repo"], m["path"]
     base = m.get("branch", "main")
@@ -548,7 +548,7 @@ def gh_dispatch_workflow(repo, workflow, ref="main"):
     """Dispara um workflow via workflow_dispatch (POST .../dispatches).
     Requer PAT com actions:write no repo e o gatilho `workflow_dispatch` no CI.
     Devolve (ok: bool, detail: str). A API responde 204 (No Content) no sucesso."""
-    if not (GITHUB_TOKEN and repo and workflow):
+    if not (TOKEN_GITHUB and repo and workflow):
         return False, "token/repo/workflow ausente"
     url = (f"{GITHUB_API}/repos/{repo}/actions/workflows/"
            f"{urllib.parse.quote(workflow)}/dispatches")
@@ -565,7 +565,7 @@ def gh_latest_run_url(repo, workflow):
     """Melhor-esforço: link para a run mais recente do workflow. A run recém
     disparada pode levar alguns segundos para aparecer na API — se ainda não
     apareceu, devolve None e o chamador cai para a aba geral de Actions."""
-    if not (GITHUB_TOKEN and repo and workflow):
+    if not (TOKEN_GITHUB and repo and workflow):
         return None
     url = (f"{GITHUB_API}/repos/{repo}/actions/workflows/"
            f"{urllib.parse.quote(workflow)}/runs?per_page=1")
@@ -815,8 +815,8 @@ def trigger_image_build(service):
         return "manual", ("auto-build desligado (ENABLE_IMAGE_BUILD=false) — "
                           "publique a imagem manualmente rodando o CI do microsserviço."), None
     m = SERVICE_CI_REPO_MAP.get(service)
-    if not (GITHUB_TOKEN and m and m.get("repo")):
-        return "manual", ("sem SERVICE_CI_REPO_MAP para este serviço (ou sem GITHUB_TOKEN) — "
+    if not (TOKEN_GITHUB and m and m.get("repo")):
+        return "manual", ("sem SERVICE_CI_REPO_MAP para este serviço (ou sem TOKEN_GITHUB) — "
                           "não sei qual pipeline disparar. Rode o CI do microsserviço para "
                           "publicar a imagem no ECR."), None
     now = time.time()
@@ -948,7 +948,7 @@ def handle_firing(incident):
 
     # ITSM: abre issue com a análise
     issue_num = None
-    if ITSM_ENABLED and GITHUB_TOKEN and ITSM_REPO:
+    if ITSM_ENABLED and TOKEN_GITHUB and ITSM_REPO:
         title = f"[Incidente] {incident.get('alertnames')} — {incident['labels'].get('service_name','?')}"
         body = (f"**Sintoma:** {incident['reason']}\n"
                 f"**Serviço:** {incident['labels'].get('service_name','?')} "
