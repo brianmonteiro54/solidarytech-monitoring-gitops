@@ -62,9 +62,13 @@ spec:
 
         # Alerta: OOMKilled — dispara o AIOps webhook, que sugere/abre PR de
         # rightsizing de memória (heurística: +50% do limite atual).
+        # ATENÇÃO: NÃO use kube_pod_container_status_last_terminated_reason —
+        # essa série não existe nesta versão do kube-state-metrics (confirmado
+        # via /api/v1/label/__name__/values). Use container_oom_events_total,
+        # métrica do cAdvisor incrementada pelo kernel a cada OOM kill real.
         - alert: OOMKilled
           expr: |
-            kube_pod_container_status_last_terminated_reason{namespace=~"solidarytech-.*", reason="OOMKilled"} == 1
+            increase(container_oom_events_total{namespace=~"solidarytech-.*"}[5m]) > 0
           for: 0m
           labels:
             severity: warning
@@ -72,7 +76,7 @@ spec:
             aiops: "true"
           annotations:
             summary: "Container {{ $labels.container }} morto por OOM"
-            description: "O container {{ $labels.container }} do pod {{ $labels.pod }} no namespace {{ $labels.namespace }} foi OOMKilled."
+            description: "O container {{ $labels.container }} do pod {{ $labels.pod }} no namespace {{ $labels.namespace }} sofreu OOM kill nos últimos 5 minutos."
 
         # Alerta: Alta latência P95
         - alert: HighLatencyP95
