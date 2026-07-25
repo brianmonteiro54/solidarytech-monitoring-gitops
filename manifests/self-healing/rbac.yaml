@@ -33,6 +33,14 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["get", "list", "create"]
+  # Necessario pro handler ExternalSecretSyncFailed ler o remoteRef.key ATUAL
+  # do ExternalSecret (ex.: ngo-service-rds em solidarytech-ngo) antes de
+  # montar o PR de correcao. Como o binding e um ClusterRoleBinding (nao um
+  # RoleBinding por namespace), isso ja vale pra TODOS os namespaces
+  # solidarytech-* sem precisar de mais nada.
+  - apiGroups: ["external-secrets.io"]
+    resources: ["externalsecrets"]
+    verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

@@ -106,6 +106,22 @@ try:
 except Exception:
     SERVICE_CI_REPO_MAP = {}
 
+# Mapa serviço -> {db_instance_id, repo, path} pra corrigir ExternalSecret
+# apontando pro secret RDS gerenciado (rds!db-<uuid>) quando o UUID fica
+# stale (instância recriada = UUID novo). db_instance_id é o identifier da
+# instância no RDS (ex.: solidarytech-prod-ngo-db); repo/path é o arquivo do
+# deploy-* onde mora o remoteRef.key. Vazio = só diagnostica (sem PR). JSON no env.
+#   SERVICE_RDS_MAP='{"ngo-service":{"db_instance_id":"solidarytech-prod-ngo-db",
+#     "repo":"brianmonteiro54/deploy-ngo-service","path":"manifests/externalsecret.yaml"},
+#     "donation-service":{"db_instance_id":"solidarytech-prod-donation-db",
+#     "repo":"brianmonteiro54/deploy-donation-service","path":"manifests/externalsecret.yaml"}}'
+# ATENÇÃO: requer rds:DescribeDBInstances no IAM do pod do webhook (separado
+# do IAM que a SecretStore usa pro ESO puxar o valor do secret em si).
+try:
+    SERVICE_RDS_MAP = json.loads(os.getenv("SERVICE_RDS_MAP", "{}"))
+except Exception:
+    SERVICE_RDS_MAP = {}
+
 # Liga/desliga o auto-build (disparo do pipeline) no ImagePullBackOff.
 ENABLE_IMAGE_BUILD = os.getenv("ENABLE_IMAGE_BUILD", "true").lower() == "true"
 # Se a causa exata do ImagePull não puder ser lida no kubelet (mensagem ausente),
@@ -544,6 +560,100 @@ def gh_open_pr_bump_memory(service, new_limit, root_cause):
     return None
 
 
+def gh_open_pr_fix_rds_secret(service, old_key, new_key, root_cause):
+    """Abre PR no repo deploy-* trocando toda ocorrência do remoteRef.key
+    ANTIGO (rds!db-<uuid> stale) pelo valor ATUAL, resolvido via
+    `aws rds describe-db-instances` (fonte da verdade). Requer
+    SERVICE_RDS_MAP[service] = {db_instance_id, repo, path}.
+    NUNCA commita direto na base branch — troca de referência de credencial
+    de banco sempre vai por PR, mesmo com REMEDIATION_MODE=auto (guard-rail
+    extra, além do circuit breaker). Devolve URL do PR ou None."""
+    m = SERVICE_RDS_MAP.get(service)
+    if not (TOKEN_GITHUB and m and m.get("repo") and m.get("path") and old_key and new_key):
+        return None
+    repo, path = m["repo"], m["path"]
+    base = m.get("branch", "main")
+    status, meta = http_json(f"{GITHUB_API}/repos/{repo}/contents/{path}?ref={base}",
+                             headers=_gh_headers())
+    if status != 200 or not isinstance(meta, dict):
+        return None
+    import base64
+    content = base64.b64decode(meta["content"]).decode("utf-8")
+    # troca literal (não regex) do valor antigo pelo novo — pode aparecer mais
+    # de uma vez no arquivo (ex.: username E password apontam pro mesmo key).
+    new_content, n = re.subn(re.escape(old_key), new_key, content)
+    if n == 0:
+        return None
+    branch = f"aiops/fix-rds-secret-{service}-{int(time.time())}"
+    status, ref = http_json(f"{GITHUB_API}/repos/{repo}/git/ref/heads/{base}", headers=_gh_headers())
+    if status != 200 or not isinstance(ref, dict):
+        return None
+    base_sha = ref["object"]["sha"]
+    http_json(f"{GITHUB_API}/repos/{repo}/git/refs",
+              data={"ref": f"refs/heads/{branch}", "sha": base_sha},
+              headers=_gh_headers(), method="POST")
+    http_json(f"{GITHUB_API}/repos/{repo}/contents/{path}",
+              data={"message": f"fix(externalsecret): {service} rds secret key desatualizado -> {new_key}",
+                    "content": base64.b64encode(new_content.encode()).decode(),
+                    "sha": meta["sha"], "branch": branch},
+              headers=_gh_headers(), method="PUT")
+    status, pr = http_json(
+        f"{GITHUB_API}/repos/{repo}/pulls",
+        data={"title": f"[AIOps] Corrige secret RDS desatualizado: {service}",
+              "head": branch, "base": base,
+              "body": (f"Auto-proposto pelo AIOps após `ExternalSecretSyncFailed`.\n\n"
+                       f"**Causa raiz:** {root_cause}\n\n"
+                       f"O `remoteRef.key` estava apontando para `{old_key}`, que não existe mais no "
+                       f"Secrets Manager (provável recriação/rotação da instância RDS `{m.get('db_instance_id')}`). "
+                       f"Valor novo resolvido consultando o RDS diretamente "
+                       f"(`aws rds describe-db-instances ... MasterUserSecret.SecretArn`, a fonte da "
+                       f"verdade — em vez de reconfiar num UUID hardcoded) -> `{new_key}`.\n\n"
+                       f"**Revise antes de aprovar** — troca de referência de credencial de banco.")},
+        headers=_gh_headers(), method="POST")
+    if status in (200, 201) and isinstance(pr, dict):
+        return pr.get("html_url")
+    return None
+
+
+def resolve_rds_secret_arn(db_instance_id, region=None):
+    """Consulta a API do RDS (fonte da verdade, não o Secrets Manager por
+    description/regex — ESO não suporta find-by-description) pelo ARN ATUAL
+    do secret gerenciado (master user password) daquela instância. Isso é o
+    que elimina a dependência do UUID 'rds!db-<resource-id>' hardcoded no
+    ExternalSecret, que muda toda vez que a instância é recriada/restaurada.
+    Requer rds:DescribeDBInstances no IAM role do pod do webhook. Devolve o
+    ARN completo (aceito pelo remoteRef.key do provider AWS do ESO) ou None."""
+    if not db_instance_id:
+        return None
+    cmd = ["aws", "rds", "describe-db-instances",
+           "--db-instance-identifier", db_instance_id,
+           "--query", "DBInstances[0].MasterUserSecret.SecretArn",
+           "--output", "text"]
+    if region:
+        cmd += ["--region", region]
+    rc, out, err = sh(cmd, timeout=20)
+    if rc != 0 or not out or out.strip().lower() == "none":
+        combined_err = (err or out or "")
+        if re.search(r"ExpiredToken|InvalidClientTokenId|token.*expired", combined_err, re.IGNORECASE):
+            log.error("RDS describe-db-instances: sessao AWS Academy expirada (aws-credentials stale). %s", combined_err)
+        else:
+            log.error("RDS describe-db-instances falhou p/ %s: rc=%s err=%s out=%s",
+                      db_instance_id, rc, err, out)
+        return None
+    return out.strip()
+
+
+def current_es_remote_key(es_name, ns):
+    """Lê o remoteRef.key ATUALMENTE configurado no ExternalSecret vivo no
+    cluster (spec.data[0]), pra saber qual valor stale substituir no PR.
+    Best-effort: devolve None se o ES não existir ou kubectl falhar."""
+    if not (es_name and ns):
+        return None
+    rc, out, _ = sh(["kubectl", "get", "externalsecret", es_name, "-n", ns,
+                     "-o", "jsonpath={.spec.data[0].remoteRef.key}"], timeout=15)
+    return out.strip() if rc == 0 and out else None
+
+
 def gh_dispatch_workflow(repo, workflow, ref="main"):
     """Dispara um workflow via workflow_dispatch (POST .../dispatches).
     Requer PAT com actions:write no repo e o gatilho `workflow_dispatch` no CI.
@@ -861,6 +971,44 @@ def remediate(incident, enr, analysis):
             return "recomendação", "manual", f"{base} Sugerido: {new} (PR não configurado p/ este serviço).", None
         return "recomendação de rightsizing", "manual", f"{base} Sugerido: {new or 'aumentar limite'}. Aplique via PR.", None
 
+    if reason == "ExternalSecretSyncFailed":
+        rm = SERVICE_RDS_MAP.get(service)
+        es_name = f"{service}-rds"
+        es_ns = ns or SERVICE_NAMESPACE_MAP.get(service)
+        if not rm or not rm.get("db_instance_id"):
+            return "diagnóstico (sem SERVICE_RDS_MAP)", "manual", \
+                   (f"ExternalSecret {es_name} não sincroniza e não há SERVICE_RDS_MAP "
+                    f"configurado para {service} — configure db_instance_id/repo/path."), None
+        old_key = current_es_remote_key(es_name, es_ns)
+        new_key = resolve_rds_secret_arn(rm["db_instance_id"])
+        if not new_key:
+            return "diagnóstico (RDS não respondeu)", "manual", \
+                   (f"Não consegui obter MasterUserSecret.SecretArn da instância "
+                    f"{rm['db_instance_id']} via describe-db-instances. Causas mais prováveis: "
+                    f"(1) sessão do AWS Academy expirada — o aws-credentials fica stale em TODOS "
+                    f"os namespaces ao mesmo tempo (~3-4h), renove reaplicando o bootstrap; "
+                    f"(2) instância inexistente/sem credenciais gerenciadas pelo RDS. "
+                    f"Veja o log do pod (aiops-webhook) para o detalhe exato do erro da AWS CLI."), None
+        if old_key and old_key == new_key:
+            return "diagnóstico (key já correta)", "manual", \
+                   (f"O remoteRef.key do ExternalSecret já bate com o secret atual do RDS "
+                    f"({new_key}) — não é UUID stale. Provável causa: IAM sem "
+                    f"secretsmanager:GetSecretValue, ou SecretStore inválida. Veja os Events "
+                    f"do ExternalSecret/SecretStore."), None
+        base = f"ExternalSecretSyncFailed em {es_name}. Key antiga: {old_key or '(não lida)'}. Key atual (RDS): {new_key}."
+        if not old_key:
+            return "diagnóstico (não li o key antigo)", "manual", \
+                   (f"{base} Não consegui ler o remoteRef.key atual via kubectl (RBAC do webhook?) "
+                    f"— sem o valor antigo não dá pra montar o diff do PR com segurança."), None
+        if not BREAKER.allow():
+            return "PR (breaker)", "manual", f"{base} (breaker de remediações/hora atingido)", None
+        pr = gh_open_pr_fix_rds_secret(service, old_key, new_key, analysis or base)
+        if pr:
+            extra = [{"name": "🔀 Pull Request", "value": pr, "inline": False}]
+            return "PR de correção do secret RDS", "pr", f"{base} PR aberto para revisão.", extra
+        return "diagnóstico", "manual", \
+               f"{base} PR não aberto — confira TOKEN_GITHUB (contents:write) e SERVICE_RDS_MAP.", None
+
     if reason in ("ImagePullBackOff", "ErrImagePull"):
         cause = inspect_image_pull_cause(ns, enr.get("pods"))
         klass = cause["class"]
@@ -911,6 +1059,8 @@ def classify_reason(alertnames, labels):
         return "ImagePullBackOff"
     if "crashloop" in joined:
         return "CrashLoopBackOff"
+    if "externalsecretsyncfailed" in joined or "secretsync" in joined:
+        return "ExternalSecretSyncFailed"
     return alertnames[0] if alertnames else "Incident"
 
 
