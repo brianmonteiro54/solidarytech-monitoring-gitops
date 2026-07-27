@@ -98,7 +98,7 @@ spec:
           backupStorageLocation:
             - name: default
               provider: aws
-              bucket: solidarytech-velero-449318170008
+              bucket: solidarytech-velero-042702827117
               default: true
               config:
                 region: us-east-1
