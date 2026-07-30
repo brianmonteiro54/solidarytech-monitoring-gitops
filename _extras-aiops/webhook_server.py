@@ -3,7 +3,6 @@
 SolidaryTech — Self-Healing + AIOps Incident Brain (webhook receiver)
 =====================================================================
 Recebe grupos de alertas do Alertmanager e trata cada grupo como UM incidente:
-
   1) ENRIQUECE   o contexto ANTES de chamar o Claude — logs do pod
      (kubectl logs --tail), Events recentes do namespace, uma consulta ao
      Prometheus (taxa de erro 5xx + latência p95 no momento) e correlação com o
@@ -23,7 +22,6 @@ Recebe grupos de alertas do Alertmanager e trata cada grupo como UM incidente:
   5) AUDITA        cada decisão como um K8s Event (kubectl get events) — rastreável.
   6) EXPÕE MÉTRICAS em /metrics (Prometheus): contadores de remediação/falha e
      histogramas de duração (detecção->correção) e de MTTR (firing->resolved).
-
 Só usa a stdlib (urllib, http.server, subprocess) para rodar na imagem alpine/k8s
 sem precisar de pip. Todas as chamadas externas são best-effort e com timeout: uma
 falha de enriquecimento nunca bloqueia a remediação nem derruba o servidor.
@@ -47,7 +45,6 @@ log = logging.getLogger("aiops-webhook")
 
 # --- Configuração (env / Secret) --------------------------------------------
 PORT = int(os.getenv("PORT", "9095"))
-
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
@@ -71,7 +68,7 @@ PROMETHEUS_URL = os.getenv(
 )
 
 # Segurança / maturidade
-REMEDIATION_MODE = os.getenv("REMEDIATION_MODE", "auto").lower()   # auto | pr
+REMEDIATION_MODE = os.getenv("REMEDIATION_MODE", "pr").lower()   # auto | pr
 ENABLE_RESTART = os.getenv("ENABLE_RESTART", "true").lower() == "true"
 MAX_REMEDIATIONS_PER_HOUR = int(os.getenv("MAX_REMEDIATIONS_PER_HOUR", "10"))
 AUDIT_EVENTS = os.getenv("AUDIT_EVENTS", "true").lower() == "true"
@@ -380,7 +377,6 @@ def prom_query(promql):
 
 def fetch_prometheus_snapshot(service):
     """Taxa de erro 5xx (%) e latência p95 (s) do serviço no momento do alerta.
-
     ATENÇÃO: os matchers de label espelham suas PrometheusRules
     (service_namespace='solidarytech', service_name, http_response_status_code).
     Se sua instrumentação usa outros nomes, ajuste aqui. Você deve validar."""
@@ -447,7 +443,6 @@ def build_enriched_context(incident):
     ns, pods = resolve_targets(labels)
     reason = incident["reason"]  # OOMKilled / ImagePullBackOff / CrashLoopBackOff / generic
     previous = reason in ("CrashLoopBackOff", "OOMKilled")  # logs do container anterior ajudam
-
     enr = {
         "namespace": ns,
         "pods": pods,
@@ -732,7 +727,6 @@ def claude_incident_analysis(incident, enr, kind="diagnosis"):
     ann = incident["annotations"]
     prom = enr.get("prometheus", {})
     dep = enr.get("last_deploy", {})
-
     if kind == "postmortem":
         instruction = (
             "Escreva um RASCUNHO de post-mortem curto em pt-BR (máx. 200 palavras), com: "
@@ -745,7 +739,6 @@ def claude_incident_analysis(incident, enr, kind="diagnosis"):
             "com: (1) causa raiz provável, (2) impacto para o doador, (3) próximos passos. "
             "Use os logs/events/métricas/rollout abaixo como evidência. Não invente dados."
         )
-
     if not ANTHROPIC_API_KEY:
         fb = f"Análise automática indisponível (sem ANTHROPIC_API_KEY). Sintoma: {incident['reason']}."
         if prom:
@@ -753,7 +746,6 @@ def claude_incident_analysis(incident, enr, kind="diagnosis"):
         if dep.get("correlated_with_deploy"):
             fb += f" Correlação: começou logo após o rollout (imagem {dep.get('image','?')})."
         return fb
-
     prompt = (
         "Você é um agente de AIOps/SRE da plataforma de doações SolidaryTech "
         "(Kubernetes + Prometheus + GitOps/ArgoCD). " + instruction + "\n\n"
@@ -1044,6 +1036,7 @@ def remediate(incident, enr, analysis):
     if labels.get("self_healing") == "true" and ns and service in SERVICE_NAMESPACE_MAP:
         r, d = do_rollout_restart(service, ns)
         return "kubectl rollout restart", r, d, None
+
     return "nenhuma (remediação manual)", "manual", "sem self_healing / serviço desconhecido — ver runbook", None
 
 
@@ -1120,6 +1113,7 @@ def handle_resolved(incident):
     """Fecha o ciclo ITSM: post-mortem + comment + close, e registra o MTTR."""
     fp = incident["fingerprint"]
     issue_num = gh_find_open_issue(fp)
+
     # MTTR (firing -> resolved)
     if incident.get("started_at") and incident.get("ended_at"):
         mttr = (incident["ended_at"] - incident["started_at"]).total_seconds()
@@ -1127,15 +1121,19 @@ def handle_resolved(incident):
             METRICS.observe("aiops_incident_duration_seconds", mttr,
                             {"agent": "webhook", "service": incident["labels"].get("service_name", "?")})
             log.info("Incidente %s resolvido | MTTR=%.0fs", fp, mttr)
+
     emit_k8s_event(SERVICE_NAMESPACE_MAP.get(incident["labels"].get("service_name", ""), "monitoring"),
                    incident["labels"].get("service_name"), reason="AIOpsResolved",
                    message=f"Incidente resolvido: {incident.get('alertnames')}", etype="Normal")
+
     if not issue_num:
         return
+
     # gera post-mortem (usa contexto leve — o incidente já foi resolvido)
     enr = {"namespace": SERVICE_NAMESPACE_MAP.get(incident["labels"].get("service_name", ""), "?"),
            "prometheus": {}, "last_deploy": {}, "events": "", "logs": ""}
     pm = claude_incident_analysis(incident, enr, kind="postmortem")
+
     started = iso(incident["started_at"]) if incident.get("started_at") else "?"
     ended = iso(incident["ended_at"]) if incident.get("ended_at") else "?"
     comment = (f"✅ **Incidente resolvido.**\n\n"
@@ -1168,6 +1166,7 @@ def build_incident(payload):
     alerts = payload.get("alerts", [])
     common = payload.get("commonLabels", {}) or {}
     group_labels = payload.get("groupLabels", {}) or {}
+
     # labels representativos: prioriza commonLabels, cai para o 1º alerta
     labels = dict(common)
     ann = {}
@@ -1189,12 +1188,14 @@ def build_incident(payload):
             starts.append(st)
         if en and en.year > 1:  # endsAt "0001-01-01" = ainda firing
             ends.append(en)
+
     labels = {k: v for k, v in labels.items() if v is not None}
     names = sorted(alertnames) or [group_labels.get("alertname", "Incident")]
     reason = classify_reason(names, labels)
     fp = payload.get("groupKey") or f"{','.join(names)}|{labels.get('service_name','?')}"
     # fingerprint estável e curto
     fp = re.sub(r"\s+", "", fp)[:120]
+
     return {
         "fingerprint": fp,
         "labels": labels,
@@ -1222,6 +1223,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(raw)
         except json.JSONDecodeError:
             return self._send(400, '{"error":"invalid JSON"}')
+
         try:
             incident = build_incident(payload)
             if incident["status"] == "resolved":
@@ -1231,6 +1233,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001  (nunca derruba o servidor)
             log.exception("Erro processando incidente: %s", e)
             return self._send(200, json.dumps({"ok": False, "error": str(e)}))
+
         return self._send(200, json.dumps({"ok": True, "fingerprint": incident["fingerprint"]}))
 
     def do_GET(self):

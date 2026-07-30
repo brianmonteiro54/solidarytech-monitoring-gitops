@@ -132,16 +132,33 @@ flowchart TD
 
 ---
 
-## Self-healing
+## Self-healing e AIOps
 
-Um pequeno servidor HTTP em Python (`self-healing-webhook`, imagem `alpine/k8s` com `kubectl`, porta `9095`) recebe os webhooks do Alertmanager e age sozinho. Ele só executa quando **as três condições** são verdadeiras:
+Um servidor HTTP em Python (`self-healing-webhook`, imagem `alpine/k8s`, porta `9095`)
+recebe os grupos de alertas do Alertmanager e trata cada grupo como um incidente.
+Antes de agir, ele enriquece o contexto: logs do pod, Events recentes do namespace,
+uma consulta ao Prometheus (erro 5xx + latência p95 no momento) e correlação com o
+último rollout. Esse contexto alimenta uma análise de causa-raiz gerada pelo Claude.
 
-1. o alerta está `firing` (não `resolved`);
-2. o label `self_healing="true"` está presente;
-3. o `service_name` é conhecido (mapeado para seu namespace).
+A remediação depende do tipo de causa (catálogo):
 
-A ação é um `kubectl rollout restart` no deployment afetado, seguido de uma notificação no Discord (✅ sucesso / ❌ falha). As permissões vêm de um `ServiceAccount` + `ClusterRole` dedicados (`deployments: get/list/patch`, `pods: get/list/delete`, `events: get/list`).
+| Causa | Ação |
+|---|---|
+| `ServiceDown` / `HighErrorRate5xx` (com `self_healing=true`) | `kubectl rollout restart` automático |
+| `OOMKilled` | calcula um novo limite de memória e **recomenda** o ajuste; abre PR automaticamente só se `REMEDIATION_MODE=pr` **e** `SERVICE_REPO_MAP` estiver configurado para o serviço |
+| `ImagePullBackOff` / `ErrImagePull` | se a imagem não existir no ECR, dispara o pipeline de CI do serviço (`workflow_dispatch`) para rebuildar e publicar |
+| `CrashLoopBackOff` | diagnóstico (logs + análise do Claude), sem ação automática |
 
+
+
+Cada incidente também vira uma **GitHub Issue** no repositório definido em
+`ITSM_REPO` (abertura no `firing`, comentário + rascunho de post-mortem gerado
+pelo Claude no `resolved`), e cada decisão de remediação é registrada como um
+**K8s Event** para auditoria. Um circuit breaker (`MAX_REMEDIATIONS_PER_HOUR`)
+evita loop de remediação em caso de alerta instável.
+
+As permissões vêm de um `ServiceAccount` + `ClusterRole` dedicados
+(`deployments: get/list/patch`, `pods: get/list/delete`, `events: get/list`).
 ---
 
 ## Disaster Recovery (Velero)
